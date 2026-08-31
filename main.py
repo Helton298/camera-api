@@ -224,8 +224,13 @@ async def register_person(
 
     person_id = get_or_create_person(client_id, name)
 
+    # guarda a propria foto de referencia no Storage, pra dar pra ver depois no dashboard
+    photo_path = f"{client_id}/people/{person_id}/{uuid.uuid4()}.jpg"
+    supabase.storage.from_("event-photos").upload(photo_path, image_bytes, {"content-type": "image/jpeg"})
+    photo_url = supabase.storage.from_("event-photos").get_public_url(photo_path)
+
     supabase.table("camera_face_embeddings").insert(
-        {"person_id": person_id, "embedding": encodings[0].tolist()}
+        {"person_id": person_id, "embedding": encodings[0].tolist(), "photo_url": photo_url}
     ).execute()
 
     return {"person_id": person_id}
@@ -260,8 +265,14 @@ async def register_person_from_event(
 
     person_id = get_or_create_person(client_id, name)
 
+    # a foto ja existe no Storage (e o proprio evento) - so reaproveita a URL
     supabase.table("camera_face_embeddings").insert(
-        {"person_id": person_id, "embedding": encodings[0].tolist(), "source_event_id": event_id}
+        {
+            "person_id": person_id,
+            "embedding": encodings[0].tolist(),
+            "source_event_id": event_id,
+            "photo_url": event["image_url"],
+        }
     ).execute()
 
     supabase.table("camera_events").update(
@@ -277,9 +288,16 @@ def list_people(
     name: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    """Lista/busca pessoas cadastradas de um cliente. `name` faz busca parcial (ex: 'fu' acha 'Fulano')."""
+    """Lista/busca pessoas cadastradas de um cliente. `name` faz busca parcial (ex: 'fu' acha 'Fulano').
+    Cada pessoa vem com `camera_face_embeddings` embutido (so id/photo_url/created_at) - as fotos
+    de referencia usadas pra cadastra-la, pra dar pra ver no dashboard."""
     check_auth(authorization)
-    query = supabase.table("camera_people").select("*").eq("client_id", client_id).order("name")
+    query = (
+        supabase.table("camera_people")
+        .select("*, camera_face_embeddings(id, photo_url, created_at)")
+        .eq("client_id", client_id)
+        .order("name")
+    )
     if name:
         query = query.ilike("name", f"%{name}%")
     return query.execute().data
