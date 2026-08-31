@@ -91,6 +91,25 @@ def find_best_match(client_id: str, embedding: np.ndarray) -> Optional[dict]:
     return result.data[0] if result.data else None
 
 
+def get_or_create_person(client_id: str, name: str) -> str:
+    """Reaproveita a pessoa se ja existe alguem com esse nome (mesmo client_id) -
+    evita criar um registro duplicado toda vez que se adiciona mais uma foto de
+    referencia da mesma pessoa (ex: nomeando varios eventos antigos dela)."""
+    existing = (
+        supabase.table("camera_people")
+        .select("id")
+        .eq("client_id", client_id)
+        .ilike("name", name)
+        .execute()
+        .data
+    )
+    if existing:
+        return existing[0]["id"]
+
+    person_result = supabase.table("camera_people").insert({"client_id": client_id, "name": name}).execute()
+    return person_result.data[0]["id"]
+
+
 def process_event_image(camera_id: str, occurred_at: str, image_bytes: bytes) -> dict:
     """Logica central compartilhada pelos dois caminhos de ingestao (agent proprio e Viseron)."""
     client_id = get_client_id_for_camera(camera_id)
@@ -203,8 +222,7 @@ async def register_person(
     if not encodings:
         raise HTTPException(status_code=400, detail="Nenhum rosto detectado na foto enviada")
 
-    person_result = supabase.table("camera_people").insert({"client_id": client_id, "name": name}).execute()
-    person_id = person_result.data[0]["id"]
+    person_id = get_or_create_person(client_id, name)
 
     supabase.table("camera_face_embeddings").insert(
         {"person_id": person_id, "embedding": encodings[0].tolist()}
@@ -240,8 +258,7 @@ async def register_person_from_event(
     if not encodings:
         raise HTTPException(status_code=400, detail="Nenhum rosto detectado na foto desse evento")
 
-    person_result = supabase.table("camera_people").insert({"client_id": client_id, "name": name}).execute()
-    person_id = person_result.data[0]["id"]
+    person_id = get_or_create_person(client_id, name)
 
     supabase.table("camera_face_embeddings").insert(
         {"person_id": person_id, "embedding": encodings[0].tolist(), "source_event_id": event_id}
