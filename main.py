@@ -23,6 +23,14 @@ Os dois caminhos convergem na mesma funcao `process_event_image()`:
 
 Nota de setup: a biblioteca `face_recognition` depende do dlib, que precisa
 de cmake/build tools no ambiente pra compilar. Ver README para instrucoes.
+
+Nota de infra: essa API fala com o Postgres so por HTTPS, via PostgREST
+(cliente supabase-py) - nunca abre conexao direta na porta 5432. Isso e
+proposital: em Supabase self-hosted (e na maioria dos hosts gerenciados),
+o Postgres nao fica acessivel publicamente, so a API REST fica. As duas
+consultas que precisariam de SQL cru (join camera->site->client, e a busca
+por similaridade no pgvector) viram funcoes SQL expostas via RPC - ver
+002_rpc_functions.sql.
 """
 
 import os
@@ -31,8 +39,6 @@ from typing import Optional
 
 import face_recognition
 import numpy as np
-import psycopg2
-import psycopg2.extras
 import requests
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Header
 from pydantic import BaseModel
@@ -42,7 +48,6 @@ app = FastAPI(title="DVR IA SaaS - API de eventos")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"]  # connection string direta do Postgres (para pgvector)
 EXPECTED_API_KEY = os.environ.get("API_KEY", "")
 
 # limiar de distancia para considerar "mesma pessoa" (face_recognition usa distancia euclidiana;
@@ -52,54 +57,32 @@ MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.6"))
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
-
-
 def check_auth(authorization: Optional[str]):
     token = (authorization or "").replace("Bearer ", "")
     if not EXPECTED_API_KEY or token != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Chave de API invalida")
 
 
-def get_client_id_for_camera(conn, camera_id: str) -> str:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select c.id
-            from camera_cameras cam
-            join camera_sites s on s.id = cam.site_id
-            join camera_clients c on c.id = s.client_id
-            where cam.id = %s
-            """,
-            (camera_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Camera nao encontrada")
-        return row[0]
+def get_client_id_for_camera(camera_id: str) -> str:
+    """Chama a funcao SQL get_client_id_for_camera via RPC (ver 002_rpc_functions.sql)."""
+    result = supabase.rpc("get_client_id_for_camera", {"p_camera_id": camera_id}).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Camera nao encontrada")
+    return result.data
 
 
-def find_best_match(conn, client_id: str, embedding: np.ndarray):
-    """Busca o rosto mais proximo dentro do mesmo client_id usando pgvector."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            select fe.person_id, fe.embedding <-> %s::vector as distance
-            from camera_face_embeddings fe
-            join camera_people p on p.id = fe.person_id
-            where p.client_id = %s
-            order by fe.embedding <-> %s::vector
-            limit 1
-            """,
-            (embedding.tolist(), client_id, embedding.tolist()),
-        )
-        return cur.fetchone()
+def find_best_match(client_id: str, embedding: np.ndarray) -> Optional[dict]:
+    """Busca o rosto mais proximo dentro do mesmo client_id, via RPC (pgvector)."""
+    result = supabase.rpc(
+        "match_face_embedding",
+        {"query_embedding": embedding.tolist(), "match_client_id": client_id},
+    ).execute()
+    return result.data[0] if result.data else None
 
 
-def process_event_image(conn, camera_id: str, occurred_at: str, image_bytes: bytes) -> dict:
+def process_event_image(camera_id: str, occurred_at: str, image_bytes: bytes) -> dict:
     """Logica central compartilhada pelos dois caminhos de ingestao (agent proprio e Viseron)."""
-    client_id = get_client_id_for_camera(conn, camera_id)
+    client_id = get_client_id_for_camera(camera_id)
 
     # 1. sobe a imagem pro Storage
     storage_path = f"{client_id}/{camera_id}/{uuid.uuid4()}.jpg"
@@ -117,7 +100,7 @@ def process_event_image(conn, camera_id: str, occurred_at: str, image_bytes: byt
         confidence = None
     else:
         embedding = encodings[0]
-        match = find_best_match(conn, client_id, embedding)
+        match = find_best_match(client_id, embedding)
         if match and match["distance"] <= MATCH_THRESHOLD:
             event_type = "face_recognized"
             person_id = match["person_id"]
@@ -127,17 +110,21 @@ def process_event_image(conn, camera_id: str, occurred_at: str, image_bytes: byt
             person_id = None
             confidence = None
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into camera_events (camera_id, event_type, image_url, person_id, match_confidence, occurred_at)
-            values (%s, %s, %s, %s, %s, %s)
-            returning id
-            """,
-            (camera_id, event_type, image_url, person_id, confidence, occurred_at),
+    result = (
+        supabase.table("camera_events")
+        .insert(
+            {
+                "camera_id": camera_id,
+                "event_type": event_type,
+                "image_url": image_url,
+                "person_id": person_id,
+                "match_confidence": confidence,
+                "occurred_at": occurred_at,
+            }
         )
-        event_id = cur.fetchone()[0]
-        conn.commit()
+        .execute()
+    )
+    event_id = result.data[0]["id"]
 
     return {"event_id": event_id, "event_type": event_type, "person_id": person_id}
 
@@ -152,12 +139,7 @@ async def create_event(
     """Usado pelo agente de captura customizado (agent/capture_agent.py)."""
     check_auth(authorization)
     image_bytes = await image.read()
-
-    conn = get_db_connection()
-    try:
-        return process_event_image(conn, camera_id, occurred_at, image_bytes)
-    finally:
-        conn.close()
+    return process_event_image(camera_id, occurred_at, image_bytes)
 
 
 class ViseronWebhookPayload(BaseModel):
@@ -190,11 +172,7 @@ async def viseron_webhook(
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Falha ao buscar snapshot do Viseron: {exc}")
 
-    conn = get_db_connection()
-    try:
-        return process_event_image(conn, payload.camera_id, payload.occurred_at, resp.content)
-    finally:
-        conn.close()
+    return process_event_image(payload.camera_id, payload.occurred_at, resp.content)
 
 
 @app.post("/people")
@@ -214,44 +192,54 @@ async def register_person(
     if not encodings:
         raise HTTPException(status_code=400, detail="Nenhum rosto detectado na foto enviada")
 
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "insert into camera_people (client_id, name) values (%s, %s) returning id",
-                (client_id, name),
-            )
-            person_id = cur.fetchone()[0]
-            cur.execute(
-                "insert into camera_face_embeddings (person_id, embedding) values (%s, %s::vector)",
-                (person_id, encodings[0].tolist()),
-            )
-            conn.commit()
-        return {"person_id": person_id}
-    finally:
-        conn.close()
+    person_result = supabase.table("camera_people").insert({"client_id": client_id, "name": name}).execute()
+    person_id = person_result.data[0]["id"]
+
+    supabase.table("camera_face_embeddings").insert(
+        {"person_id": person_id, "embedding": encodings[0].tolist()}
+    ).execute()
+
+    return {"person_id": person_id}
+
+
+@app.get("/people")
+def list_people(
+    client_id: str,
+    name: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Lista/busca pessoas cadastradas de um cliente. `name` faz busca parcial (ex: 'fu' acha 'Fulano')."""
+    check_auth(authorization)
+    query = supabase.table("camera_people").select("*").eq("client_id", client_id).order("name")
+    if name:
+        query = query.ilike("name", f"%{name}%")
+    return query.execute().data
 
 
 @app.get("/events")
 def list_events(
     camera_id: Optional[str] = None,
+    person_id: Optional[str] = None,
+    person_name: Optional[str] = None,
     limit: int = 50,
     authorization: Optional[str] = Header(None),
 ):
+    """`person_name` e um atalho: busca pessoas com esse nome e ja filtra os eventos delas,
+    pra nao precisar chamar /people antes so pra descobrir o person_id."""
     check_auth(authorization)
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if camera_id:
-                cur.execute(
-                    "select * from camera_events where camera_id = %s order by occurred_at desc limit %s",
-                    (camera_id, limit),
-                )
-            else:
-                cur.execute("select * from camera_events order by occurred_at desc limit %s", (limit,))
-            return cur.fetchall()
-    finally:
-        conn.close()
+
+    query = supabase.table("camera_events").select("*").order("occurred_at", desc=True).limit(limit)
+    if camera_id:
+        query = query.eq("camera_id", camera_id)
+    if person_id:
+        query = query.eq("person_id", person_id)
+    if person_name:
+        people = supabase.table("camera_people").select("id").ilike("name", f"%{person_name}%").execute().data
+        person_ids = [p["id"] for p in people]
+        if not person_ids:
+            return []
+        query = query.in_("person_id", person_ids)
+    return query.execute().data
 
 
 def _bytes_to_face_image(image_bytes: bytes) -> np.ndarray:
