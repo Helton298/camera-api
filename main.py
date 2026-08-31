@@ -41,10 +41,21 @@ import face_recognition
 import numpy as np
 import requests
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
 app = FastAPI(title="DVR IA SaaS - API de eventos")
+
+# CORS liberado geral - o dashboard (Artifact, roda no navegador) precisa
+# chamar essa API de outro dominio. Ja existe autenticacao por API_KEY em
+# cada rota, entao liberar origem nao abre a API pra quem nao tem a chave.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -198,6 +209,47 @@ async def register_person(
     supabase.table("camera_face_embeddings").insert(
         {"person_id": person_id, "embedding": encodings[0].tolist()}
     ).execute()
+
+    return {"person_id": person_id}
+
+
+@app.post("/people/from-event")
+async def register_person_from_event(
+    event_id: str = Form(...),
+    name: str = Form(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Nomeia uma pessoa usando a foto de um evento ja existente (ex: um
+    'face_unknown' visto no dashboard) - sem precisar tirar uma foto nova.
+    Tambem atualiza esse mesmo evento pra 'face_recognized'."""
+    check_auth(authorization)
+
+    event_result = supabase.table("camera_events").select("*").eq("id", event_id).execute()
+    if not event_result.data:
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    event = event_result.data[0]
+
+    client_id = get_client_id_for_camera(event["camera_id"])
+
+    resp = requests.get(event["image_url"], timeout=10)
+    resp.raise_for_status()
+    image_bytes = resp.content
+
+    np_image = _bytes_to_face_image(image_bytes)
+    encodings = face_recognition.face_encodings(np_image)
+    if not encodings:
+        raise HTTPException(status_code=400, detail="Nenhum rosto detectado na foto desse evento")
+
+    person_result = supabase.table("camera_people").insert({"client_id": client_id, "name": name}).execute()
+    person_id = person_result.data[0]["id"]
+
+    supabase.table("camera_face_embeddings").insert(
+        {"person_id": person_id, "embedding": encodings[0].tolist(), "source_event_id": event_id}
+    ).execute()
+
+    supabase.table("camera_events").update(
+        {"event_type": "face_recognized", "person_id": person_id, "match_confidence": 0.0}
+    ).eq("id", event_id).execute()
 
     return {"person_id": person_id}
 
